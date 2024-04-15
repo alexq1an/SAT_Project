@@ -25,7 +25,7 @@
 #include <unordered_map>
 #include <cmath> // For std::abs
 
-#define DEFAULT_NUMBER_OF_THREADS "4"
+#include <mpi.h>
 
 // Define a Clause as a vector of integers, where each integer represents a variable
 // Positive values denote the variable, and negative values denote its negation.
@@ -36,13 +36,121 @@ typedef std::vector<Clause> Formula;
 std::atomic<bool> found_solution{false};
 std::atomic<bool> all_workers_should_stop{false};
 
+std::vector<int> completedTask;
+
 struct Task {
     Formula formula;
     std::map<int, std::optional<bool>> assignment;
 
     Task(Formula f, std::map<int, std::optional<bool>> a)
         : formula(f), assignment(a) {}
+
+    Task() = default;
 };
+
+// Serialize Task into a byte array
+std::vector<char> serializeTask(const Task& task) {
+    std::vector<char> buffer;
+
+    // Serialize Formula
+    size_t numClauses = task.formula.size();
+    buffer.insert(buffer.end(), reinterpret_cast<const char*>(&numClauses), reinterpret_cast<const char*>(&numClauses + 1));
+    for (const auto& clause : task.formula) {
+        size_t clauseSize = clause.size();
+        buffer.insert(buffer.end(), reinterpret_cast<const char*>(&clauseSize), reinterpret_cast<const char*>(&clauseSize + 1));
+        for (int literal : clause) {
+            buffer.insert(buffer.end(), reinterpret_cast<const char*>(&literal), reinterpret_cast<const char*>(&literal + 1));
+        }
+    }
+    
+    // Serialize Assignment Map
+    size_t mapSize = task.assignment.size();
+    buffer.insert(buffer.end(), reinterpret_cast<const char*>(&mapSize), reinterpret_cast<const char*>(&mapSize + 1));
+    for (const auto& [key, opt_val] : task.assignment) {
+        buffer.insert(buffer.end(), reinterpret_cast<const char*>(&key), reinterpret_cast<const char*>(&key + 1));
+        bool hasValue = opt_val.has_value();
+        buffer.insert(buffer.end(), reinterpret_cast<const char*>(&hasValue), reinterpret_cast<const char*>(&hasValue + 1));
+        if (hasValue) {
+            bool value = *opt_val;
+            buffer.insert(buffer.end(), reinterpret_cast<const char*>(&value), reinterpret_cast<const char*>(&value + 1));
+        }
+    }
+
+    return buffer;
+}
+
+
+// Deserialize Task from a byte array
+Task deserializeTask(const std::vector<char>& buffer) {
+    size_t pos = 0;
+    Task task;
+    
+    // Deserialize the formula
+    size_t numClauses = *reinterpret_cast<const size_t*>(buffer.data() + pos);
+    pos += sizeof(size_t);
+    task.formula.resize(numClauses);
+    for (auto& clause : task.formula) {
+        size_t clauseSize = *reinterpret_cast<const size_t*>(buffer.data() + pos);
+        pos += sizeof(size_t);
+        clause.resize(clauseSize);
+        for (int& literal : clause) {
+            literal = *reinterpret_cast<const int*>(buffer.data() + pos);
+            pos += sizeof(int);
+        }
+    }
+    
+    // Deserialize the assignment map
+    size_t mapSize = *reinterpret_cast<const size_t*>(buffer.data() + pos);
+    pos += sizeof(size_t);
+    for (size_t i = 0; i < mapSize; ++i) {
+        int key = *reinterpret_cast<const int*>(buffer.data() + pos);
+        pos += sizeof(int);
+        bool hasValue = *reinterpret_cast<const bool*>(buffer.data() + pos);
+        pos += sizeof(bool);
+        std::optional<bool> opt_val;
+        if (hasValue) {
+            bool value = *reinterpret_cast<const bool*>(buffer.data() + pos);
+            pos += sizeof(bool);
+            opt_val = value;
+        }
+        task.assignment[key] = opt_val;
+    }
+
+    return task;
+}
+
+
+
+// MPI send and receive wrappers
+void sendTask(const std::shared_ptr<Task>& taskPtr, int dest, int tag, MPI_Comm comm) {
+    if (!taskPtr) {
+        std::cerr << "Error: Attempted to send a null Task pointer." << std::endl;
+        return;  // Optionally handle this case more gracefully
+    }
+    auto buffer = serializeTask(*taskPtr);  // Dereference the shared_ptr to access the Task
+    int result = MPI_Send(buffer.data(), buffer.size(), MPI_CHAR, dest, tag, comm);
+    if (result != MPI_SUCCESS) {
+        // Handle MPI errors (e.g., print error message)
+        char error_string[1024];
+        int length_of_error_string;
+        MPI_Error_string(result, error_string, &length_of_error_string);
+        std::cerr << "MPI_Send failed: " << error_string << std::endl;
+    }
+}
+
+std::shared_ptr<Task> recvTask(int source, int tag, MPI_Comm comm) {
+    MPI_Status status;
+    int num_bytes;
+    MPI_Probe(source, tag, comm, &status);
+    MPI_Get_count(&status, MPI_CHAR, &num_bytes);
+    std::vector<char> buffer(num_bytes);
+    MPI_Recv(buffer.data(), num_bytes, MPI_CHAR, source, tag, comm, &status);
+
+    // Assuming deserializeTask returns a Task object
+    Task* raw_task = new Task(deserializeTask(buffer));  // Allocate a new Task
+    std::shared_ptr<Task> task_ptr(raw_task);  // Now manage this Task with shared_ptr
+    return task_ptr;
+}
 
 class TaskQueue {
     std::queue<std::shared_ptr<Task>> queue;
@@ -87,7 +195,7 @@ public:
 };
 
 
-
+std::queue<std::shared_ptr<Task>> taskQueue;  // Global task queue managed by the master
 
 // Function to read a CNF file in DIMACS format and populate the formula
 bool readDIMACSCNF(const std::string& filename, Formula& formula, int& numVariables) {
@@ -188,6 +296,16 @@ Formula simplifyFormula(const Formula& formula,
 }
 
 
+uint countAssigned(const std::map<int, std::optional<bool>>& assignment){
+    uint count = 0;
+    for (const auto& [key, val] : assignment) {
+        if (val.has_value()) {  // Equivalent to checking if val is std::nullopt
+            count++;
+        }
+    }
+    return count;
+}
+
 // See if by assigning clauses with only one missing value can satisfy, return true if unit clause is satisfiable
 bool unitPropagation(Formula& formula, std::map<int, std::optional<bool>>& assignment) {
     bool changed = true;
@@ -285,7 +403,7 @@ bool isFormulaSatisfied(const Formula& formula, const std::map<int, std::optiona
     return true;
 }
 
-void makeDecisionAndSpawn(std::shared_ptr<Task> task, TaskQueue& taskQueue) {
+void makeDecisionAndSpawn(std::shared_ptr<Task> task) {
     // Find the first unassigned variable
     int variable = -1;
     for (const auto& [var, val] : task->assignment) {
@@ -304,8 +422,10 @@ void makeDecisionAndSpawn(std::shared_ptr<Task> task, TaskQueue& taskQueue) {
             Formula newFormula = task->formula; // Copy formula to potentially simplify
             // if (!unitPropagation(newFormula, newAssignment)) continue; // Skip unsatisfiable path
 
-            std::shared_ptr<Task> newNode = std::make_shared<Task>(newFormula, newAssignment);
-            taskQueue.addTask(newNode);
+            std::shared_ptr<Task> newTask = std::make_shared<Task>(newFormula, newAssignment);
+            // taskQueue.addTask(newNode);
+            // Send the new task over
+            sendTask(newTask, 0, 2, MPI_COMM_WORLD); // tag 2 means new task submission
         }
     } 
     // If no available variable found
@@ -316,31 +436,8 @@ void makeDecisionAndSpawn(std::shared_ptr<Task> task, TaskQueue& taskQueue) {
     return;
 }
 
-uint countAssigned(const std::map<int, std::optional<bool>>& assignment){
-    uint count = 0;
-    for (const auto& [key, val] : assignment) {
-        if (val.has_value()) {  // Equivalent to checking if val is std::nullopt
-            count++;
-        }
-    }
-    return count;
-}
 
-void worker(TaskQueue& taskQueue, uint thread_id, uint n_threads) {
-    while (!all_workers_should_stop.load()) {
-        auto task = taskQueue.getTask();
-        // Wait for task
-        if (task == nullptr || found_solution.load()) {
-            break; // Exit if no task or solution found
-        }
-        // Count the task given
-        taskQueue.completed_task[thread_id]++;
-
-        if (taskQueue.completed_task[thread_id] % 1000 == 0){
-            std::cout << "Thread number  " << thread_id << ", numOfTask: "  << taskQueue.completed_task[thread_id] << "\n";
-            std::cout << "Assigned number:  " << countAssigned(task->assignment) << "\n";
-        }
-
+bool handleTask(std::shared_ptr<Task> task){
         // std::cout << "START\n";
         // for (const auto& [var, val] : task->assignment) {
         //     if (val.has_value()) {
@@ -350,7 +447,7 @@ void worker(TaskQueue& taskQueue, uint thread_id, uint n_threads) {
 
         // PROCESS THE TASK
         // If the current assignment does not satisfy, then skip
-        if (!unitPropagation(task->formula, task->assignment)) continue;
+        if (!unitPropagation(task->formula, task->assignment)) return false;
 
         // std::cout << "AFTER UNITPROP\n";
         // for (const auto& [var, val] : task->assignment) {
@@ -376,47 +473,151 @@ void worker(TaskQueue& taskQueue, uint thread_id, uint n_threads) {
         task->formula = simplifyFormula(task->formula, task->assignment);
 
         if (isFormulaSatisfied(task->formula, task->assignment)) {
-            found_solution.store(true);
-            all_workers_should_stop.store(true);
-            taskQueue.notifyAllWorkers();  // notify all threads
+            // std::cout << "SATISFIABLE\n";
+            // for (const auto& [var, val] : task->assignment) {
+            //     if (val.has_value()) {
+            //         std::cout << "Variable " << var << " = " << (val.value() ? "True" : "False") << "\n";
+            //     }
+            // }
+
+            return true;
+        }
+        
+        makeDecisionAndSpawn(task);
+        return false;
+}
+
+void master(uint world_size) {
+    MPI_Status status;
+    int flag;
+    std::shared_ptr<Task> task;
+
+    std::vector<bool> active(world_size, true);  // Track active workers.
+    int active_count = world_size - 1;
+
+    int remaining_workers = world_size-1;
+
+    while (remaining_workers > 0) {
+
+        bool all_tasks_should_terminate = false;
+        // Check for any incoming message
+        MPI_Probe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
+
+        // if (taskQueue.completed_task[thread_id] % 1000 == 0){
+        //     std::cout << "Thread number  " << thread_id << ", numOfTask: "  << taskQueue.completed_task[thread_id] << "\n";
+        //     std::cout << "Assigned number:  " << countAssigned(task->assignment) << "\n";
+        // }
+        if (all_tasks_should_terminate) {
+            int source = status.MPI_SOURCE;
+            std::cout << "Worker " << source << " want to term" << std::endl;
+
+            int dummy;
+            MPI_Recv(&dummy, 0, MPI_INT, source, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
+
+            int signal = -1;  // Let's use -1 as a termination code.
+            MPI_Send(&signal, 1, MPI_INT, source, 3, MPI_COMM_WORLD);  // Using tag 3 for termination.
+
+            // If this not not a finished task sent
+            remaining_workers--;
+            continue;
+        }
+        // Determine message type based on the tag
+        else if (status.MPI_TAG == 1) {  // Assuming tag 1 means task request
+            int source = status.MPI_SOURCE;
+            MPI_Recv(&flag, 1, MPI_INT, source, 1, MPI_COMM_WORLD, &status);  // Dummy receive to complete the probe
+            // Send a task if available
+            if (!taskQueue.empty()) {
+                task = taskQueue.front();
+                taskQueue.pop();
+
+                // Count 
+                completedTask[source]++;
+                sendTask(task, source, 0, MPI_COMM_WORLD);  // Assuming tag 0 means sending a task
+            } else {
+                // Send a no-task signal, for example, by sending a special task or an empty message with a specific tag
+                MPI_Send(&flag, 0, MPI_INT, source, 2, MPI_COMM_WORLD);  // Assuming tag 2 means no task available
+            }
+        }
+        else if (status.MPI_TAG == 2) {  // Assuming tag 2 means new task submission
+            task = recvTask(status.MPI_SOURCE, 2, MPI_COMM_WORLD);
+            taskQueue.push(task);
+        }
+        else if (status.MPI_TAG == 3) {  // Handle other types of messages, like termination
+            int source = status.MPI_SOURCE;
+            MPI_Recv(&flag, 3, MPI_INT, source, 3, MPI_COMM_WORLD, &status);
+
+            std::cout << "Task completed" << "\n";
+            all_tasks_should_terminate = true;
+            remaining_workers--;
+            
+            std::shared_ptr<Task> task = recvTask(status.MPI_SOURCE, 4, MPI_COMM_WORLD);
+
             std::cout << "SATISFIABLE\n";
             for (const auto& [var, val] : task->assignment) {
                 if (val.has_value()) {
                     std::cout << "Variable " << var << " = " << (val.value() ? "True" : "False") << "\n";
                 }
             }
-            // Stats
-            for (uint i = 0; i < n_threads; i++){
-                std::cout << "Thread number " << i << " finished " << taskQueue.completed_task[i] << " tasks." << "\n";
-            }
-            break;
+
         }
-        
-        makeDecisionAndSpawn(task, taskQueue);
+    }
+    // Stat
+    for (uint i = 1; i < world_size; i++){
+        std::cout << "Thread number " << i << " finished " << completedTask[i] << " tasks." << "\n";
+    }
+}
+
+// To Master                            To Woker
+// Tag 0:                               New task recieved
+// Tag 1: Task request
+// Tag 2: New task recieved             No Available task
+// Tag 3: Compelete                     Compelete
+
+void worker(uint rank, uint word_size) {
+    while (true) {
+        // Request a task from the master
+        int flag = 1;  // Dummy flag to signal a request
+        MPI_Send(&flag, 1, MPI_INT, 0, 1, MPI_COMM_WORLD);  // Send request to master (rank 0) with tag 1
+
+        // Receive the task or a signal that no task is available
+        MPI_Status status;
+        MPI_Probe(0, MPI_ANY_TAG, MPI_COMM_WORLD, &status);  // Check source and tag
+
+        if (status.MPI_TAG == 0) {  // Assuming tag 0 means a task is sent
+            std::shared_ptr<Task> task = recvTask(0, 0, MPI_COMM_WORLD);
+            // std::cout << "Worker " << rank << " received a task." << std::endl;
+            
+            if (handleTask(task)){
+                MPI_Send(&flag, 1, MPI_INT, 0, 3, MPI_COMM_WORLD);  // Send termination signal to master (rank 0) with tag 3
+                // Send the task to master to print
+                sendTask(task, 0, 4, MPI_COMM_WORLD);
+                break;
+            }
+            // Process the task
+            // std::cout << "Worker " << rank << " completed processing the task." << std::endl;
+
+            // Optionally, send results or new tasks back to the master
+            // sendTask(resultTask, 0, 2, MPI_COMM_WORLD); // Example: Send new task to master with tag 2
+
+        } else if (status.MPI_TAG == 2) {  // Assuming tag 2 means no more tasks
+            int dummy;
+            MPI_Recv(&dummy, 0, MPI_INT, 0, 2, MPI_COMM_WORLD, &status);  // Receive the no-task message
+            // std::cout << "Worker " << rank << " no more tasks available." << std::endl;
+            // break;  // Exit the loop and finish work
+        }
+        else if (status.MPI_TAG == 3) {
+            int dummy;
+            MPI_Recv(&dummy, 0, MPI_INT, 0, 3, MPI_COMM_WORLD, &status);  // Receive the no-task message
+            int message;
+            MPI_Recv(&message, 1, MPI_INT, 0, 3, MPI_COMM_WORLD, &status);
+            std::cout << "Worker " << rank << ": Received termination signal." << std::endl;
+            break;  // Exit the loop
+        }
     }
     // std::cout << thread_id << std::endl;
 }
 
 int main(int argc, char *argv[]) {
-
-    cxxopts::Options options(
-        "page_rank_push",
-        "Calculate page_rank using serial and parallel execution");
-    options.add_options(
-        "",
-        {
-            {"nThreads", "Number of Threads",
-            cxxopts::value<uint>()->default_value(DEFAULT_NUMBER_OF_THREADS)},
-        });
-
-    auto cl_options = options.parse(argc, argv);
-    uint n_threads = cl_options["nThreads"].as<uint>();
-    if (n_threads <= 0){
-        std::cout << "Number of Threads cannot be less than 0" << std::endl;
-        std::cout << "Exiting." << std::endl;
-        return -1;
-    }
-
 
     std::string filename = "sat_problem.cnf"; 
     Formula formula;
@@ -428,8 +629,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    timer t_parallel;
-    t_parallel.start();
+    timer t_mpi;
+    t_mpi.start();
 
     std::map<int, std::optional<bool>> initial_assignment;
 
@@ -439,26 +640,51 @@ int main(int argc, char *argv[]) {
     }
 
     std::shared_ptr<Task> root = std::make_shared<Task>(formula, initial_assignment);
-    TaskQueue taskQueue(n_threads);
-    taskQueue.addTask(root);
+    taskQueue.push(root);
 
-    std::cout << "Number of processes : " << n_threads << "\n";
+    MPI_Init(NULL, NULL);
 
-    // Start worker threads
-    std::vector<std::thread> workers;
-    for (int i = 0; i < n_threads; ++i) {
-        workers.emplace_back(worker, std::ref(taskQueue), i, n_threads);
+    // Get the number of processes
+    int world_size;
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+
+    completedTask.resize(world_size);
+
+    // Get the rank of the process
+    int world_rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+
+    if (world_size < 2 && world_rank == 0){
+        std::cout << "Need at least two thread to maintain queue" << "\n";
+        return -1;
     }
-    // Join threads
-    for (auto& t : workers) {
-        t.join();  
+
+    // Get the name of the processor
+    char processor_name[MPI_MAX_PROCESSOR_NAME];
+    int name_len;
+    MPI_Get_processor_name(processor_name, &name_len);
+
+    if (world_rank == 0){
+        std::cout << "Number of processes : " << world_size << "\n";
     }
 
-    double parallelTime = t_parallel.stop();
+    // Start master threads
+    if (world_rank == 0){
+        master(world_size);
+    }
+    else{
+        // Start worker threads
+        worker(world_rank, world_size);
+    }
 
-    std::cout << "Parallel execution time used : " << parallelTime << " seconds"<< std::endl;
+    double parallelTime = t_mpi.stop();
 
-    std::cout << "All tasks completed. Program terminating." << std::endl;
+    if (world_rank == 0){
+        std::cout << "MPI execution time used : " << parallelTime << " seconds"<< std::endl;
+        std::cout << "All tasks completed. Program terminating." << std::endl;
+    }
+
+    MPI_Finalize();
 
     return 0;
 }
