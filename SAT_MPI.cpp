@@ -497,9 +497,10 @@ void master(uint world_size) {
 
     int remaining_workers = world_size-1;
 
+    bool all_tasks_should_terminate = false;
+
     while (remaining_workers > 0) {
 
-        bool all_tasks_should_terminate = false;
         // Check for any incoming message
         MPI_Probe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
 
@@ -507,22 +508,21 @@ void master(uint world_size) {
         //     std::cout << "Thread number  " << thread_id << ", numOfTask: "  << taskQueue.completed_task[thread_id] << "\n";
         //     std::cout << "Assigned number:  " << countAssigned(task->assignment) << "\n";
         // }
-        if (all_tasks_should_terminate) {
+        if (status.MPI_TAG == 1 && all_tasks_should_terminate) {
             int source = status.MPI_SOURCE;
-            std::cout << "Worker " << source << " want to term" << std::endl;
+            // std::cout << "Worker " << source << " want to term" << std::endl;
 
             int dummy;
-            MPI_Recv(&dummy, 0, MPI_INT, source, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
+            MPI_Recv(&flag, 1, MPI_INT, source, 1, MPI_COMM_WORLD, &status);  // Dummy receive to complete the probe
 
             int signal = -1;  // Let's use -1 as a termination code.
             MPI_Send(&signal, 1, MPI_INT, source, 3, MPI_COMM_WORLD);  // Using tag 3 for termination.
 
-            // If this not not a finished task sent
             remaining_workers--;
             continue;
         }
         // Determine message type based on the tag
-        else if (status.MPI_TAG == 1) {  // Assuming tag 1 means task request
+        else if (status.MPI_TAG == 1) {  // Tag 1 means task request
             int source = status.MPI_SOURCE;
             MPI_Recv(&flag, 1, MPI_INT, source, 1, MPI_COMM_WORLD, &status);  // Dummy receive to complete the probe
             // Send a task if available
@@ -532,17 +532,17 @@ void master(uint world_size) {
 
                 // Count 
                 completedTask[source]++;
-                sendTask(task, source, 0, MPI_COMM_WORLD);  // Assuming tag 0 means sending a task
+                sendTask(task, source, 0, MPI_COMM_WORLD);  // Tag 0 means sending a task
             } else {
                 // Send a no-task signal, for example, by sending a special task or an empty message with a specific tag
-                MPI_Send(&flag, 0, MPI_INT, source, 2, MPI_COMM_WORLD);  // Assuming tag 2 means no task available
+                MPI_Send(&flag, 0, MPI_INT, source, 2, MPI_COMM_WORLD);  // Tag 2 means no task available
             }
         }
-        else if (status.MPI_TAG == 2) {  // Assuming tag 2 means new task submission
+        else if (status.MPI_TAG == 2) {  // Tag 2 means new task submission
             task = recvTask(status.MPI_SOURCE, 2, MPI_COMM_WORLD);
             taskQueue.push(task);
         }
-        else if (status.MPI_TAG == 3) {  // Handle other types of messages, like termination
+        else if (status.MPI_TAG == 3 && !all_tasks_should_terminate) {  // Handle other types of messages, like termination
             int source = status.MPI_SOURCE;
             MPI_Recv(&flag, 3, MPI_INT, source, 3, MPI_COMM_WORLD, &status);
 
@@ -558,7 +558,14 @@ void master(uint world_size) {
                     std::cout << "Variable " << var << " = " << (val.value() ? "True" : "False") << "\n";
                 }
             }
-
+        }
+        else if (status.MPI_TAG == 3){
+            int source = status.MPI_SOURCE;
+            // Dummy recv terminate request
+            MPI_Recv(&flag, 3, MPI_INT, source, 3, MPI_COMM_WORLD, &status);
+            // Dunmmy recv task
+            std::shared_ptr<Task> task = recvTask(status.MPI_SOURCE, 4, MPI_COMM_WORLD);
+            remaining_workers--;
         }
     }
     // Stat
@@ -587,30 +594,25 @@ void worker(uint rank, uint word_size) {
             std::shared_ptr<Task> task = recvTask(0, 0, MPI_COMM_WORLD);
             // std::cout << "Worker " << rank << " received a task." << std::endl;
             
+            // If found the solution terminate all threads
+            // Process the task
             if (handleTask(task)){
                 MPI_Send(&flag, 1, MPI_INT, 0, 3, MPI_COMM_WORLD);  // Send termination signal to master (rank 0) with tag 3
                 // Send the task to master to print
                 sendTask(task, 0, 4, MPI_COMM_WORLD);
                 break;
             }
-            // Process the task
             // std::cout << "Worker " << rank << " completed processing the task." << std::endl;
 
-            // Optionally, send results or new tasks back to the master
-            // sendTask(resultTask, 0, 2, MPI_COMM_WORLD); // Example: Send new task to master with tag 2
-
-        } else if (status.MPI_TAG == 2) {  // Assuming tag 2 means no more tasks
+        }
+        else if (status.MPI_TAG == 2) {  // Tag 2 means no task right now
             int dummy;
             MPI_Recv(&dummy, 0, MPI_INT, 0, 2, MPI_COMM_WORLD, &status);  // Receive the no-task message
-            // std::cout << "Worker " << rank << " no more tasks available." << std::endl;
-            // break;  // Exit the loop and finish work
         }
         else if (status.MPI_TAG == 3) {
             int dummy;
-            MPI_Recv(&dummy, 0, MPI_INT, 0, 3, MPI_COMM_WORLD, &status);  // Receive the no-task message
-            int message;
-            MPI_Recv(&message, 1, MPI_INT, 0, 3, MPI_COMM_WORLD, &status);
-            std::cout << "Worker " << rank << ": Received termination signal." << std::endl;
+            MPI_Recv(&dummy, 1, MPI_INT, 0, 3, MPI_COMM_WORLD, &status);
+            // std::cout << "Worker " << rank << ": Received termination signal." << std::endl;
             break;  // Exit the loop
         }
     }
